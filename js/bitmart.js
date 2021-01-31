@@ -48,7 +48,7 @@ module.exports = class bitmart extends Exchange {
                 'logo': 'https://user-images.githubusercontent.com/1294454/61835713-a2662f80-ae85-11e9-9d00-6442919701fd.jpg',
                 'api': 'https://api-cloud.{hostname}', // bitmart.info for Hong Kong users
                 'www': 'https://www.bitmart.com/',
-                'doc': 'https://github.com/bitmartexchange/bitmart-official-api-docs',
+                'doc': 'https://developer-pro.bitmart.com/',
                 'referral': 'http://www.bitmart.com/?r=rQCFLh',
                 'fees': 'https://www.bitmart.com/fee/en',
             },
@@ -161,8 +161,8 @@ module.exports = class bitmart extends Exchange {
                 'trading': {
                     'tierBased': true,
                     'percentage': true,
-                    'taker': 0.002,
-                    'maker': 0.001,
+                    'taker': 0.0025,
+                    'maker': 0.0025,
                     'tiers': {
                         'taker': [
                             [0, 0.20 / 100],
@@ -296,6 +296,7 @@ module.exports = class bitmart extends Exchange {
                 'broad': {},
             },
             'commonCurrencies': {
+                'COT': 'Community Coin',
                 'ONE': 'Menlo One',
                 'PLA': 'Plair',
             },
@@ -433,7 +434,7 @@ module.exports = class bitmart extends Exchange {
             //
             const pricePrecision = this.safeInteger (market, 'price_max_precision');
             const precision = {
-                'amount': this.safeFloat (market, 'quote_increment'),
+                'amount': this.safeFloat (market, 'base_min_size'),
                 'price': parseFloat (this.decimalToPrecision (Math.pow (10, -pricePrecision), ROUND, 10)),
             };
             const minBuyCost = this.safeFloat (market, 'min_buy_amount');
@@ -672,32 +673,15 @@ module.exports = class bitmart extends Exchange {
         //
         const timestamp = this.safeTimestamp (ticker, 'timestamp', this.milliseconds ());
         const marketId = this.safeString2 (ticker, 'symbol', 'contract_id');
-        let symbol = undefined;
-        if (marketId !== undefined) {
-            if (marketId in this.markets_by_id) {
-                market = this.markets_by_id[marketId];
-            } else if (marketId !== undefined) {
-                const [ baseId, quoteId ] = marketId.split ('_');
-                const base = this.safeCurrencyCode (baseId);
-                const quote = this.safeCurrencyCode (quoteId);
-                symbol = base + '/' + quote;
-            }
-        }
-        if ((symbol === undefined) && (market !== undefined)) {
-            symbol = market['symbol'];
-        }
+        const symbol = this.safeSymbol (marketId, market, '_');
         const last = this.safeFloat2 (ticker, 'close_24h', 'last_price');
         let percentage = this.safeFloat (ticker, 'fluctuation', 'rise_fall_rate');
         if (percentage !== undefined) {
             percentage *= 100;
         }
-        // bitmart base/quote reversed
-        const baseVolume = this.safeFloat2 (ticker, 'quote_volume_24h', 'base_coin_volume');
-        const quoteVolume = this.safeFloat2 (ticker, 'base_volume_24h', 'quote_coin_volume');
-        let vwap = undefined;
-        if ((quoteVolume !== undefined) && (baseVolume !== undefined) && (baseVolume !== 0)) {
-            vwap = quoteVolume / baseVolume;
-        }
+        const baseVolume = this.safeFloat2 (ticker, 'base_volume_24h', 'base_coin_volume');
+        const quoteVolume = this.safeFloat2 (ticker, 'quote_volume_24h', 'quote_coin_volume');
+        const vwap = this.vwap (baseVolume, quoteVolume);
         const open = this.safeFloat2 (ticker, 'open_24h', 'open');
         let average = undefined;
         if ((last !== undefined) && (open !== undefined)) {
@@ -1015,6 +999,11 @@ module.exports = class bitmart extends Exchange {
                 side = 'sell';
             }
         }
+        let takerOrMaker = undefined;
+        const execType = this.safeString (trade, 'exec_type');
+        if (execType !== undefined) {
+            takerOrMaker = (execType === 'M') ? 'maker' : 'taker';
+        }
         let price = this.safeFloat2 (trade, 'price', 'deal_price');
         price = this.safeFloat (trade, 'price_avg', price);
         let amount = this.safeFloat2 (trade, 'amount', 'deal_vol');
@@ -1025,23 +1014,7 @@ module.exports = class bitmart extends Exchange {
         }
         const orderId = this.safeInteger (trade, 'order_id');
         const marketId = this.safeString2 (trade, 'contract_id', 'symbol');
-        let symbol = undefined;
-        if (marketId !== undefined) {
-            if (marketId in this.markets_by_id) {
-                market = this.markets_by_id[marketId];
-                symbol = market['symbol'];
-            } else {
-                const [ baseId, quoteId ] = marketId.split ('_');
-                const base = this.safeCurrencyCode (baseId);
-                const quote = this.safeCurrencyCode (quoteId);
-                symbol = base + '/' + quote;
-            }
-        }
-        if (symbol === undefined) {
-            if (market !== undefined) {
-                symbol = market['symbol'];
-            }
-        }
+        const symbol = this.safeSymbol (marketId, market, '_');
         const feeCost = this.safeFloat (trade, 'fees');
         let fee = undefined;
         if (feeCost !== undefined) {
@@ -1067,7 +1040,7 @@ module.exports = class bitmart extends Exchange {
             'price': price,
             'amount': amount,
             'cost': cost,
-            'takerOrMaker': undefined,
+            'takerOrMaker': takerOrMaker,
             'fee': fee,
         };
     }
@@ -1277,7 +1250,7 @@ module.exports = class bitmart extends Exchange {
         const request = {};
         if (market['spot']) {
             request['symbol'] = market['id'];
-            request['offset'] = 1;
+            request['offset'] = 1; // max offset * limit < 500
             if (limit === undefined) {
                 limit = 100; // max 100
             }
@@ -1568,21 +1541,8 @@ module.exports = class bitmart extends Exchange {
         id = this.safeString (order, 'order_id', id);
         let timestamp = this.parse8601 (this.safeString (order, 'created_at'));
         timestamp = this.safeInteger (order, 'create_time', timestamp);
-        let symbol = undefined;
         const marketId = this.safeString2 (order, 'symbol', 'contract_id');
-        if (marketId !== undefined) {
-            if (marketId in this.markets_by_id) {
-                market = this.markets_by_id[marketId];
-            } else {
-                const [ baseId, quoteId ] = marketId.split ('_');
-                const base = this.safeCurrencyCode (baseId);
-                const quote = this.safeCurrencyCode (quoteId);
-                symbol = base + '/' + quote;
-            }
-        }
-        if ((symbol === undefined) && (market !== undefined)) {
-            symbol = market['symbol'];
-        }
+        const symbol = this.safeSymbol (marketId, market, '_');
         let status = undefined;
         if (market !== undefined) {
             status = this.parseOrderStatusByType (market['type'], this.safeString (order, 'status'));
@@ -1640,8 +1600,11 @@ module.exports = class bitmart extends Exchange {
             'lastTradeTimestamp': undefined,
             'symbol': symbol,
             'type': type,
+            'timeInForce': undefined,
+            'postOnly': undefined,
             'side': side,
             'price': price,
+            'stopPrice': undefined,
             'amount': amount,
             'cost': cost,
             'average': average,
@@ -1772,6 +1735,15 @@ module.exports = class bitmart extends Exchange {
         //         }
         //     }
         //
+        // spot alternative
+        //
+        //     {
+        //         "code": 1000,
+        //         "trace":"886fb6ae-456b-4654-b4e0-d681ac05cea1",
+        //         "message": "OK",
+        //         "data": true
+        //     }
+        //
         // contract
         //
         //     {
@@ -1787,6 +1759,9 @@ module.exports = class bitmart extends Exchange {
         //     }
         //
         const data = this.safeValue (response, 'data');
+        if (data === true) {
+            return this.parseOrder (id, market);
+        }
         const succeeded = this.safeValue (data, 'succeed');
         if (succeeded !== undefined) {
             id = this.safeString (succeeded, 0);
@@ -2002,7 +1977,7 @@ module.exports = class bitmart extends Exchange {
 
     async fetchOrders (symbol = undefined, since = undefined, limit = undefined, params = {}) {
         if (symbol === undefined) {
-            throw new ArgumentsRequired (this.id + ' fetchOrders requires a symbol argument');
+            throw new ArgumentsRequired (this.id + ' fetchOrders() requires a symbol argument');
         }
         await this.loadMarkets ();
         const market = this.market (symbol);

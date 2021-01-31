@@ -4,7 +4,7 @@
 
 const Exchange = require ('./base/Exchange');
 const { TICK_SIZE } = require ('./base/functions/number');
-const { ExchangeError, InvalidOrder, BadRequest, InsufficientFunds, OrderNotFound, AuthenticationError } = require ('./base/errors');
+const { ExchangeError, InvalidOrder, BadRequest, InsufficientFunds, OrderNotFound, AuthenticationError, RateLimitExceeded, ExchangeNotAvailable, CancelPending } = require ('./base/errors');
 
 //  ---------------------------------------------------------------------------
 
@@ -14,7 +14,7 @@ module.exports = class ftx extends Exchange {
             'id': 'ftx',
             'name': 'FTX',
             'countries': [ 'HK' ],
-            'rateLimit': 100,
+            'rateLimit': 34,
             'certified': true,
             'pro': true,
             'hostname': 'ftx.com', // or ftx.us
@@ -33,6 +33,7 @@ module.exports = class ftx extends Exchange {
                 'cancelAllOrders': true,
                 'cancelOrder': true,
                 'createOrder': true,
+                'editOrder': true,
                 'fetchBalance': true,
                 'fetchClosedOrders': false,
                 'fetchCurrencies': true,
@@ -98,9 +99,11 @@ module.exports = class ftx extends Exchange {
                         'wallet/coins',
                         'wallet/balances',
                         'wallet/all_balances',
-                        'wallet/deposit_address/{coin}',
+                        'wallet/deposit_address/{coin}', // ?method={method}
                         'wallet/deposits',
                         'wallet/withdrawals',
+                        'wallet/airdrops',
+                        'wallet/saved_addresses',
                         'orders', // ?market={market}
                         'orders/history', // ?market={market}
                         'orders/{order_id}',
@@ -108,6 +111,14 @@ module.exports = class ftx extends Exchange {
                         'conditional_orders', // ?market={market}
                         'conditional_orders/{conditional_order_id}/triggers',
                         'conditional_orders/history', // ?market={market}
+                        'spot_margin/borrow_rates',
+                        'spot_margin/lending_rates',
+                        'spot_margin/borrow_summary',
+                        'spot_margin/market_info', // ?market={market}
+                        'spot_margin/borrow_history',
+                        'spot_margin/lending_history',
+                        'spot_margin/offers',
+                        'spot_margin/lending_info',
                         'fills', // ?market={market}
                         'funding_payments',
                         // leverage tokens
@@ -126,15 +137,23 @@ module.exports = class ftx extends Exchange {
                         'options/account_info',
                         'options/positions',
                         'options/fills',
+                        // staking
+                        'staking/stakes',
+                        'staking/unstake_requests',
+                        'staking/balances',
+                        'staking/staking_rewards',
                     ],
                     'post': [
                         'account/leverage',
                         'wallet/withdrawals',
+                        'wallet/saved_addresses',
                         'orders',
                         'conditional_orders',
                         'orders/{order_id}/modify',
                         'orders/by_client_id/{client_order_id}/modify',
                         'conditional_orders/{order_id}/modify',
+                        // spot margin
+                        'spot_margin/offers',
                         // leverage tokens
                         'lt/{token_name}/create',
                         'lt/{token_name}/redeem',
@@ -149,8 +168,12 @@ module.exports = class ftx extends Exchange {
                         'options/requests',
                         'options/requests/{request_id}/quotes',
                         'options/quotes/{quote_id}/accept',
+                        // staking
+                        'staking/unstake_requests',
+                        'srm_stakes/stakes',
                     ],
                     'delete': [
+                        'wallet/saved_addresses/{saved_address_id}',
                         'orders/{order_id}',
                         'orders/by_client_id/{client_order_id}',
                         'orders',
@@ -160,6 +183,8 @@ module.exports = class ftx extends Exchange {
                         // options
                         'options/requests/{request_id}',
                         'options/quotes/{quote_id}',
+                        // staking
+                        'staking/unstake_requests/{request_id}',
                     ],
                 },
             },
@@ -194,6 +219,7 @@ module.exports = class ftx extends Exchange {
             },
             'exceptions': {
                 'exact': {
+                    'Size too small for provide': InvalidOrder, // {"error":"Size too small for provide","success":false}
                     'Not logged in': AuthenticationError, // {"error":"Not logged in","success":false}
                     'Not enough balances': InsufficientFunds, // {"error":"Not enough balances","success":false}
                     'InvalidPrice': InvalidOrder, // {"error":"Invalid price","success":false}
@@ -201,13 +227,18 @@ module.exports = class ftx extends Exchange {
                     'Missing parameter price': InvalidOrder, // {"error":"Missing parameter price","success":false}
                     'Order not found': OrderNotFound, // {"error":"Order not found","success":false}
                     'Order already closed': InvalidOrder, // {"error":"Order already closed","success":false}
+                    'Order already queued for cancellation': CancelPending, // {"error":"Order already queued for cancellation","success":false}
                 },
                 'broad': {
+                    'Account does not have enough margin for order': InsufficientFunds,
                     'Invalid parameter': BadRequest, // {"error":"Invalid parameter start_time","success":false}
                     'The requested URL was not found on the server': BadRequest,
                     'No such coin': BadRequest,
                     'No such market': BadRequest,
-                    'An unexpected error occurred': ExchangeError, // {"error":"An unexpected error occurred, please try again later (58BC21C795).","success":false}
+                    'Do not send more than': RateLimitExceeded,
+                    'An unexpected error occurred': ExchangeNotAvailable, // {"error":"An unexpected error occurred, please try again later (58BC21C795).","success":false}
+                    'Please retry request': ExchangeNotAvailable, // {"error":"Please retry request","success":false}
+                    'Please try again': ExchangeNotAvailable, // {"error":"Please try again","success":false}
                 },
             },
             'precisionMode': TICK_SIZE,
@@ -337,7 +368,7 @@ module.exports = class ftx extends Exchange {
                 'amount': sizeIncrement,
                 'price': priceIncrement,
             };
-            const entry = {
+            result.push ({
                 'id': id,
                 'symbol': symbol,
                 'base': base,
@@ -364,8 +395,7 @@ module.exports = class ftx extends Exchange {
                     },
                 },
                 'info': market,
-            };
-            result.push (entry);
+            });
         }
         return result;
     }
@@ -664,22 +694,39 @@ module.exports = class ftx extends Exchange {
         //         "type": "order"
         //     }
         //
+        //     {
+        //         "baseCurrency": "BTC",
+        //         "fee": 0,
+        //         "feeCurrency": "USD",
+        //         "feeRate": 0,
+        //         "future": null,
+        //         "id": 664079556,
+        //         "liquidity": "taker",
+        //         "market": null,
+        //         "orderId": null,
+        //         "price": 34830.61359,
+        //         "quoteCurrency": "USD",
+        //         "side": "sell",
+        //         "size": 0.0005996,
+        //         "time": "2021-01-15T16:05:29.246135+00:00",
+        //         "tradeId": null,
+        //         "type": "otc"
+        //     }
+        //
         const id = this.safeString (trade, 'id');
         const takerOrMaker = this.safeString (trade, 'liquidity');
         const marketId = this.safeString (trade, 'market');
         let symbol = undefined;
-        if (marketId !== undefined) {
-            if (marketId in this.markets_by_id) {
-                market = this.markets_by_id[marketId];
-                symbol = market['symbol'];
+        if (marketId in this.markets_by_id) {
+            market = this.markets_by_id[marketId];
+            symbol = market['symbol'];
+        } else {
+            const base = this.safeCurrencyCode (this.safeString (trade, 'baseCurrency'));
+            const quote = this.safeCurrencyCode (this.safeString (trade, 'quoteCurrency'));
+            if ((base !== undefined) && (quote !== undefined)) {
+                symbol = base + '/' + quote;
             } else {
-                const base = this.safeCurrencyCode (this.safeString (trade, 'baseCurrency'));
-                const quote = this.safeCurrencyCode (this.safeString (trade, 'quoteCurrency'));
-                if ((base !== undefined) && (quote !== undefined)) {
-                    symbol = base + '/' + quote;
-                } else {
-                    symbol = marketId;
-                }
+                symbol = marketId;
             }
         }
         const timestamp = this.parse8601 (this.safeString (trade, 'time'));
@@ -854,7 +901,7 @@ module.exports = class ftx extends Exchange {
 
     parseOrder (order, market = undefined) {
         //
-        // limit orders - fetchOrder, fetchOrders, fetchOpenOrders, createOrder
+        // limit orders - fetchOrder, fetchOrders, fetchOpenOrders, createOrder, editOrder
         //
         //     {
         //         "createdAt": "2019-03-05T09:56:55.728933+00:00",
@@ -912,6 +959,29 @@ module.exports = class ftx extends Exchange {
         //         "error": null,
         //         "triggeredAt": null,
         //         "reduceOnly": false
+        //     }
+        //
+        // editOrder (conditional, stop, trailing stop, take profit)
+        //
+        //     {
+        //         "createdAt": "2019-03-05T09:56:55.728933+00:00",
+        //         "future": "XRP-PERP",
+        //         "id": 9596912,
+        //         "market": "XRP-PERP",
+        //         "triggerPrice": 0.306225,
+        //         "orderId": null,
+        //         "side": "sell",
+        //         "size": 31431,
+        //         "status": "open",
+        //         "type": "stop",
+        //         "orderPrice": null,
+        //         "error": null,
+        //         "triggeredAt": null,
+        //         "reduceOnly": false,
+        //         "orderType": "market",
+        //         "filledSize": 0,
+        //         "avgFillPrice": null,
+        //         "retryUntilFilled": false
         //     }
         //
         // canceled order with a closed status
@@ -973,6 +1043,8 @@ module.exports = class ftx extends Exchange {
         }
         const lastTradeTimestamp = this.parse8601 (this.safeString (order, 'triggeredAt'));
         const clientOrderId = this.safeString (order, 'clientId');
+        const stopPrice = this.safeFloat (order, 'triggerPrice');
+        const postOnly = this.safeValue (order, 'postOnly');
         return {
             'info': order,
             'id': id,
@@ -982,8 +1054,11 @@ module.exports = class ftx extends Exchange {
             'lastTradeTimestamp': lastTradeTimestamp,
             'symbol': symbol,
             'type': type,
+            'timeInForce': undefined,
+            'postOnly': postOnly,
             'side': side,
             'price': price,
+            'stopPrice': stopPrice,
             'amount': amount,
             'cost': cost,
             'average': average,
@@ -1089,6 +1164,104 @@ module.exports = class ftx extends Exchange {
         return this.parseOrder (result, market);
     }
 
+    async editOrder (id, symbol, type, side, amount, price = undefined, params = {}) {
+        await this.loadMarkets ();
+        const market = this.market (symbol);
+        const request = {};
+        let method = undefined;
+        const clientOrderId = this.safeString2 (params, 'client_order_id', 'clientOrderId');
+        const triggerPrice = this.safeFloat (params, 'triggerPrice');
+        const orderPrice = this.safeFloat (params, 'orderPrice');
+        const trailValue = this.safeFloat (params, 'trailValue');
+        params = this.omit (params, [ 'client_order_id', 'clientOrderId', 'triggerPrice', 'orderPrice', 'trailValue' ]);
+        const triggerPriceIsDefined = (triggerPrice !== undefined);
+        const orderPriceIsDefined = (orderPrice !== undefined);
+        const trailValueIsDefined = (trailValue !== undefined);
+        if (triggerPriceIsDefined || orderPriceIsDefined || trailValueIsDefined) {
+            method = 'privatePostConditionalOrdersOrderIdModify';
+            request['order_id'] = id;
+            if (triggerPriceIsDefined) {
+                request['triggerPrice'] = parseFloat (this.priceToPrecision (symbol, triggerPrice));
+            }
+            if (orderPriceIsDefined) {
+                // only for stop limit or take profit limit orders
+                request['orderPrice'] = parseFloat (this.priceToPrecision (symbol, orderPrice));
+            }
+            if (trailValueIsDefined) {
+                // negative for sell orders, positive for buy orders
+                request['trailValue'] = parseFloat (this.priceToPrecision (symbol, trailValue));
+            }
+        } else {
+            if (clientOrderId === undefined) {
+                method = 'privatePostOrdersOrderIdModify';
+                request['order_id'] = id;
+            } else {
+                method = 'privatePostOrdersByClientIdClientOrderIdModify';
+                request['client_order_id'] = clientOrderId;
+                // request['clientId'] = clientOrderId;
+            }
+            if (price !== undefined) {
+                request['price'] = parseFloat (this.priceToPrecision (symbol, price));
+            }
+        }
+        if (amount !== undefined) {
+            request['size'] = parseFloat (this.amountToPrecision (symbol, amount));
+        }
+        const response = await this[method] (this.extend (request, params));
+        //
+        // regular order
+        //
+        //     {
+        //         "success": true,
+        //         "result": {
+        //             "createdAt": "2019-03-05T11:56:55.728933+00:00",
+        //             "filledSize": 0,
+        //             "future": "XRP-PERP",
+        //             "id": 9596932,
+        //             "market": "XRP-PERP",
+        //             "price": 0.326525,
+        //             "remainingSize": 31431,
+        //             "side": "sell",
+        //             "size": 31431,
+        //             "status": "open",
+        //             "type": "limit",
+        //             "reduceOnly": false,
+        //             "ioc": false,
+        //             "postOnly": false,
+        //             "clientId": null,
+        //         }
+        //     }
+        //
+        // conditional trigger order
+        //
+        //     {
+        //         "success": true,
+        //         "result": {
+        //             "createdAt": "2019-03-05T09:56:55.728933+00:00",
+        //             "future": "XRP-PERP",
+        //             "id": 9596912,
+        //             "market": "XRP-PERP",
+        //             "triggerPrice": 0.306225,
+        //             "orderId": null,
+        //             "side": "sell",
+        //             "size": 31431,
+        //             "status": "open",
+        //             "type": "stop",
+        //             "orderPrice": null,
+        //             "error": null,
+        //             "triggeredAt": null,
+        //             "reduceOnly": false,
+        //             "orderType": "market",
+        //             "filledSize": 0,
+        //             "avgFillPrice": null,
+        //             "retryUntilFilled": false
+        //         }
+        //     }
+        //
+        const result = this.safeValue (response, 'result', {});
+        return this.parseOrder (result, market);
+    }
+
     async cancelOrder (id, symbol = undefined, params = {}) {
         await this.loadMarkets ();
         const request = {
@@ -1124,11 +1297,17 @@ module.exports = class ftx extends Exchange {
 
     async cancelAllOrders (symbol = undefined, params = {}) {
         await this.loadMarkets ();
+        const conditionalOrdersOnly = this.safeValue (params, 'conditionalOrdersOnly');
         const request = {
             // 'market': market['id'], // optional
-            'conditionalOrdersOnly': false, // cancel conditional orders only
-            'limitOrdersOnly': false, // cancel existing limit orders (non-conditional orders) only
+            // 'conditionalOrdersOnly': false, // cancel conditional orders only
+            // 'limitOrdersOnly': false, // cancel existing limit orders (non-conditional orders) only
         };
+        if (conditionalOrdersOnly) {
+            request['conditionalOrdersOnly'] = conditionalOrdersOnly;
+        } else {
+            request['limitOrdersOnly'] = true;
+        }
         const marketId = this.getMarketId (symbol, 'market', params);
         if (marketId !== undefined) {
             request['market'] = marketId;
@@ -1296,6 +1475,7 @@ module.exports = class ftx extends Exchange {
         }
         if (since !== undefined) {
             request['start_time'] = parseInt (since / 1000);
+            request['end_time'] = this.seconds ();
         }
         const response = await this.privateGetFills (this.extend (request, params));
         //
@@ -1361,6 +1541,60 @@ module.exports = class ftx extends Exchange {
         //
         const result = this.safeValue (response, 'result', {});
         return this.parseTransaction (result, currency);
+    }
+
+    async fetchPositions (symbols = undefined, since = undefined, limit = undefined, params = {}) {
+        await this.loadMarkets ();
+        const response = await this.privateGetAccount (params);
+        //
+        //     {
+        //         "result":{
+        //             "backstopProvider":false,
+        //             "chargeInterestOnNegativeUsd":false,
+        //             "collateral":2830.2567913677476,
+        //             "freeCollateral":2829.670741867416,
+        //             "initialMarginRequirement":0.05,
+        //             "leverage":20.0,
+        //             "liquidating":false,
+        //             "maintenanceMarginRequirement":0.03,
+        //             "makerFee":0.0,
+        //             "marginFraction":null,
+        //             "openMarginFraction":null,
+        //             "positionLimit":null,
+        //             "positionLimitUsed":null,
+        //             "positions":[
+        //                 {
+        //                     "collateralUsed":0.0,
+        //                     "cost":0.0,
+        //                     "entryPrice":null,
+        //                     "estimatedLiquidationPrice":null,
+        //                     "future":"XRP-PERP",
+        //                     "initialMarginRequirement":0.05,
+        //                     "longOrderSize":0.0,
+        //                     "maintenanceMarginRequirement":0.03,
+        //                     "netSize":0.0,
+        //                     "openSize":0.0,
+        //                     "realizedPnl":0.016,
+        //                     "shortOrderSize":0.0,
+        //                     "side":"buy",
+        //                     "size":0.0,
+        //                     "unrealizedPnl":0.0,
+        //                 }
+        //             ],
+        //             "spotLendingEnabled":false,
+        //             "spotMarginEnabled":false,
+        //             "takerFee":0.0007,
+        //             "totalAccountValue":2830.2567913677476,
+        //             "totalPositionSize":0.0,
+        //             "useFttCollateral":true,
+        //             "username":"igor.kroitor@gmail.com"
+        //         },
+        //         "success":true
+        //     }
+        //
+        const result = this.safeValue (response, 'result', {});
+        // todo unify parsePosition/parsePositions
+        return this.safeValue (result, 'positions', []);
     }
 
     async fetchDepositAddress (code, params = {}) {
@@ -1431,6 +1665,15 @@ module.exports = class ftx extends Exchange {
         //         "txid": "0x8078356ae4b06a036d64747546c274af19581f1c78c510b60505798a7ffcaf1"
         //     }
         //
+        //     {
+        //         'coin': 'USD',
+        //         'id': '503722',
+        //         'notes': 'Transfer',
+        //         'size': '3.35',
+        //         'status': 'complete',
+        //         'time': '2020-10-06T03:20:34.201556+00:00',
+        //     }
+        //
         const code = this.safeCurrencyCode (this.safeString (transaction, 'coin'));
         const id = this.safeString (transaction, 'id');
         const amount = this.safeFloat (transaction, 'size');
@@ -1444,7 +1687,6 @@ module.exports = class ftx extends Exchange {
             address = this.safeString (address, 'address');
         }
         const fee = this.safeFloat (transaction, 'fee');
-        const type = ('destinationName' in transaction) ? 'withdrawal' : 'deposit';
         return {
             'info': transaction,
             'id': id,
@@ -1457,7 +1699,7 @@ module.exports = class ftx extends Exchange {
             'tagFrom': undefined,
             'tag': tag,
             'tagTo': tag,
-            'type': type,
+            'type': undefined,
             'amount': amount,
             'currency': code,
             'status': status,
@@ -1495,7 +1737,7 @@ module.exports = class ftx extends Exchange {
         if (code !== undefined) {
             currency = this.currency (code);
         }
-        return this.parseTransactions (result, currency, since, limit);
+        return this.parseTransactions (result, currency, since, limit, { 'type': 'deposit' });
     }
 
     async fetchWithdrawals (code = undefined, since = undefined, limit = undefined, params = {}) {
@@ -1522,7 +1764,7 @@ module.exports = class ftx extends Exchange {
         if (code !== undefined) {
             currency = this.currency (code);
         }
-        return this.parseTransactions (result, currency, since, limit);
+        return this.parseTransactions (result, currency, since, limit, { 'type': 'withdrawal' });
     }
 
     sign (path, api = 'public', method = 'GET', params = {}, headers = undefined, body = undefined) {
@@ -1542,7 +1784,7 @@ module.exports = class ftx extends Exchange {
             const timestamp = this.milliseconds ().toString ();
             let auth = timestamp + method + request;
             headers = {};
-            if (method === 'POST') {
+            if ((method === 'POST') || (method === 'DELETE')) {
                 body = this.json (query);
                 auth += body;
                 headers['Content-Type'] = 'application/json';

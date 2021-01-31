@@ -73,7 +73,7 @@ class bitmart(Exchange):
                 'logo': 'https://user-images.githubusercontent.com/1294454/61835713-a2662f80-ae85-11e9-9d00-6442919701fd.jpg',
                 'api': 'https://api-cloud.{hostname}',  # bitmart.info for Hong Kong users
                 'www': 'https://www.bitmart.com/',
-                'doc': 'https://github.com/bitmartexchange/bitmart-official-api-docs',
+                'doc': 'https://developer-pro.bitmart.com/',
                 'referral': 'http://www.bitmart.com/?r=rQCFLh',
                 'fees': 'https://www.bitmart.com/fee/en',
             },
@@ -186,8 +186,8 @@ class bitmart(Exchange):
                 'trading': {
                     'tierBased': True,
                     'percentage': True,
-                    'taker': 0.002,
-                    'maker': 0.001,
+                    'taker': 0.0025,
+                    'maker': 0.0025,
                     'tiers': {
                         'taker': [
                             [0, 0.20 / 100],
@@ -321,6 +321,7 @@ class bitmart(Exchange):
                 'broad': {},
             },
             'commonCurrencies': {
+                'COT': 'Community Coin',
                 'ONE': 'Menlo One',
                 'PLA': 'Plair',
             },
@@ -452,7 +453,7 @@ class bitmart(Exchange):
             #
             pricePrecision = self.safe_integer(market, 'price_max_precision')
             precision = {
-                'amount': self.safe_float(market, 'quote_increment'),
+                'amount': self.safe_float(market, 'base_min_size'),
                 'price': float(self.decimal_to_precision(math.pow(10, -pricePrecision), ROUND, 10)),
             }
             minBuyCost = self.safe_float(market, 'min_buy_amount')
@@ -685,27 +686,14 @@ class bitmart(Exchange):
         #
         timestamp = self.safe_timestamp(ticker, 'timestamp', self.milliseconds())
         marketId = self.safe_string_2(ticker, 'symbol', 'contract_id')
-        symbol = None
-        if marketId is not None:
-            if marketId in self.markets_by_id:
-                market = self.markets_by_id[marketId]
-            elif marketId is not None:
-                baseId, quoteId = marketId.split('_')
-                base = self.safe_currency_code(baseId)
-                quote = self.safe_currency_code(quoteId)
-                symbol = base + '/' + quote
-        if (symbol is None) and (market is not None):
-            symbol = market['symbol']
+        symbol = self.safe_symbol(marketId, market, '_')
         last = self.safe_float_2(ticker, 'close_24h', 'last_price')
         percentage = self.safe_float(ticker, 'fluctuation', 'rise_fall_rate')
         if percentage is not None:
             percentage *= 100
-        # bitmart base/quote reversed
-        baseVolume = self.safe_float_2(ticker, 'quote_volume_24h', 'base_coin_volume')
-        quoteVolume = self.safe_float_2(ticker, 'base_volume_24h', 'quote_coin_volume')
-        vwap = None
-        if (quoteVolume is not None) and (baseVolume is not None) and (baseVolume != 0):
-            vwap = quoteVolume / baseVolume
+        baseVolume = self.safe_float_2(ticker, 'base_volume_24h', 'base_coin_volume')
+        quoteVolume = self.safe_float_2(ticker, 'quote_volume_24h', 'quote_coin_volume')
+        vwap = self.vwap(baseVolume, quoteVolume)
         open = self.safe_float_2(ticker, 'open_24h', 'open')
         average = None
         if (last is not None) and (open is not None):
@@ -1007,6 +995,10 @@ class bitmart(Exchange):
                 side = 'buy'
             else:
                 side = 'sell'
+        takerOrMaker = None
+        execType = self.safe_string(trade, 'exec_type')
+        if execType is not None:
+            takerOrMaker = 'maker' if (execType == 'M') else 'taker'
         price = self.safe_float_2(trade, 'price', 'deal_price')
         price = self.safe_float(trade, 'price_avg', price)
         amount = self.safe_float_2(trade, 'amount', 'deal_vol')
@@ -1016,19 +1008,7 @@ class bitmart(Exchange):
             cost = amount * price
         orderId = self.safe_integer(trade, 'order_id')
         marketId = self.safe_string_2(trade, 'contract_id', 'symbol')
-        symbol = None
-        if marketId is not None:
-            if marketId in self.markets_by_id:
-                market = self.markets_by_id[marketId]
-                symbol = market['symbol']
-            else:
-                baseId, quoteId = marketId.split('_')
-                base = self.safe_currency_code(baseId)
-                quote = self.safe_currency_code(quoteId)
-                symbol = base + '/' + quote
-        if symbol is None:
-            if market is not None:
-                symbol = market['symbol']
+        symbol = self.safe_symbol(marketId, market, '_')
         feeCost = self.safe_float(trade, 'fees')
         fee = None
         if feeCost is not None:
@@ -1052,7 +1032,7 @@ class bitmart(Exchange):
             'price': price,
             'amount': amount,
             'cost': cost,
-            'takerOrMaker': None,
+            'takerOrMaker': takerOrMaker,
             'fee': fee,
         }
 
@@ -1250,7 +1230,7 @@ class bitmart(Exchange):
         request = {}
         if market['spot']:
             request['symbol'] = market['id']
-            request['offset'] = 1
+            request['offset'] = 1  # max offset * limit < 500
             if limit is None:
                 limit = 100  # max 100
             request['limit'] = limit
@@ -1530,18 +1510,8 @@ class bitmart(Exchange):
         id = self.safe_string(order, 'order_id', id)
         timestamp = self.parse8601(self.safe_string(order, 'created_at'))
         timestamp = self.safe_integer(order, 'create_time', timestamp)
-        symbol = None
         marketId = self.safe_string_2(order, 'symbol', 'contract_id')
-        if marketId is not None:
-            if marketId in self.markets_by_id:
-                market = self.markets_by_id[marketId]
-            else:
-                baseId, quoteId = marketId.split('_')
-                base = self.safe_currency_code(baseId)
-                quote = self.safe_currency_code(quoteId)
-                symbol = base + '/' + quote
-        if (symbol is None) and (market is not None):
-            symbol = market['symbol']
+        symbol = self.safe_symbol(marketId, market, '_')
         status = None
         if market is not None:
             status = self.parse_order_status_by_type(market['type'], self.safe_string(order, 'status'))
@@ -1587,8 +1557,11 @@ class bitmart(Exchange):
             'lastTradeTimestamp': None,
             'symbol': symbol,
             'type': type,
+            'timeInForce': None,
+            'postOnly': None,
             'side': side,
             'price': price,
+            'stopPrice': None,
             'amount': amount,
             'cost': cost,
             'average': average,
@@ -1707,6 +1680,15 @@ class bitmart(Exchange):
         #         }
         #     }
         #
+        # spot alternative
+        #
+        #     {
+        #         "code": 1000,
+        #         "trace":"886fb6ae-456b-4654-b4e0-d681ac05cea1",
+        #         "message": "OK",
+        #         "data": True
+        #     }
+        #
         # contract
         #
         #     {
@@ -1722,6 +1704,8 @@ class bitmart(Exchange):
         #     }
         #
         data = self.safe_value(response, 'data')
+        if data is True:
+            return self.parse_order(id, market)
         succeeded = self.safe_value(data, 'succeed')
         if succeeded is not None:
             id = self.safe_string(succeeded, 0)
@@ -1917,7 +1901,7 @@ class bitmart(Exchange):
 
     def fetch_orders(self, symbol=None, since=None, limit=None, params={}):
         if symbol is None:
-            raise ArgumentsRequired(self.id + ' fetchOrders requires a symbol argument')
+            raise ArgumentsRequired(self.id + ' fetchOrders() requires a symbol argument')
         self.load_markets()
         market = self.market(symbol)
         if not (market['swap'] or market['future']):
